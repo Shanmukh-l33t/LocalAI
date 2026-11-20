@@ -264,6 +264,12 @@ var _ = Describe("designated owner lifecycle", func() {
 		Expect(s.Generations).To(HaveLen(3))
 		for n, g := range s.Generations {
 			Expect(g.Number).To(Equal(uint64(n + 1)))
+			// The journal keeps every generation; the disk keeps the two a
+			// rollback can need, and the older package is gone after a commit.
+			if n < len(s.Generations)-packageGenerations {
+				Expect(g.Receipt.Directory).NotTo(BeADirectory())
+				continue
+			}
 			Expect(filepath.Join(g.Receipt.Directory, "receipt.json")).To(BeAnExistingFile())
 		}
 	})

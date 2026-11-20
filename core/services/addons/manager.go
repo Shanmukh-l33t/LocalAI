@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -900,8 +901,86 @@ func (m *Manager) apply(op journalOperation) (OperationStatus, error) {
 		// an add-on the Authority does not know yet.
 		m.noteIdentity(op.Command.AddonID, m.journal.Addons[op.Command.AddonID])
 		m.markCompleted(op.Command.OperationID)
+		if op.Command.Action == "install" || op.Command.Action == "upgrade" {
+			m.prunePackages()
+		}
 	}
 	return op.Status, e
+}
+
+// packageGenerations is how many published packages an add-on keeps on disk:
+// the generation that is running and the one before it, for a rollback.
+const packageGenerations = 2
+
+// prunePackages removes the packages that no generation needs any more. The
+// keep set comes from the journal, never from directory times: the current and
+// the previous generation of every add-on, plus the package of an operation
+// whose generation the journal does not hold yet. Only the names Commit
+// publishes, directly under the package root, are ever removed.
+func (m *Manager) prunePackages() {
+	if m.installer == nil {
+		return
+	}
+	keep := map[string]bool{}
+	add := func(dir string) {
+		if dir != "" {
+			keep[filepath.Clean(dir)] = true
+		}
+	}
+	for _, st := range m.journal.Addons {
+		gs := slices.Clone(st.Generations)
+		sort.Slice(gs, func(a, b int) bool { return gs[a].Number > gs[b].Number })
+		if len(gs) > packageGenerations {
+			gs = gs[:packageGenerations]
+		}
+		for _, g := range gs {
+			add(g.Receipt.Directory)
+		}
+	}
+	for _, op := range m.journal.Operations {
+		if op.Next != nil {
+			for _, g := range op.Next.Generations {
+				add(g.Receipt.Directory)
+			}
+		}
+	}
+	// A package published for a client that went away runs again under the
+	// same operation ID, so it is live too.
+	for _, r := range m.canceled {
+		add(r.Directory)
+	}
+	rootPath, e := filepath.Abs(m.installer.Root)
+	if e != nil {
+		return
+	}
+	root, e := openPackageRoot(rootPath)
+	if os.IsNotExist(e) {
+		return
+	}
+	if e != nil {
+		xlog.Warn("Could not open the addon package root", "error", e)
+		return
+	}
+	defer func() { _ = root.Close() }()
+	entries, e := fs.ReadDir(root.FS(), ".")
+	if e != nil {
+		xlog.Warn("Could not list the addon package root", "error", e)
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "package-stage-") {
+			continue
+		}
+		dir := filepath.Join(rootPath, entry.Name())
+		if keep[dir] {
+			continue
+		}
+		if e = removePackage(root, entry.Name()); e != nil {
+			xlog.Warn("Could not remove an unused addon package", "path", dir, "error", e)
+			continue
+		}
+		xlog.Info("Removed an unused addon package", "path", dir)
+	}
 }
 func (m *Manager) Reconcile(ctx context.Context) error {
 	m.opMu.Lock()
@@ -947,6 +1026,9 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			return ErrConfiguration
 		}
 	}
+	// A host that ran before retention kept every package it ever published.
+	// The journal says which ones it still needs.
+	m.prunePackages()
 	m.reconcileData(ctx)
 	for id, op := range m.journal.Operations {
 		if op.Async && op.Status.Phase == string(lifecycleFailed) && m.dataBlocked(op.Command.AddonID) {
@@ -1007,7 +1089,6 @@ func syncPackage(root string) error {
 	}
 	return nil
 }
-
 
 // AttachRuntime is owner-only. Durable reconciliation precedes process execution.
 func (m *Manager) AttachRuntime(ctx context.Context, s *addonruntime.Supervisor) error {
